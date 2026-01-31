@@ -1,0 +1,5 @@
+﻿PySide6
+numpy
+sounddevice
+soundfile
+openai-whisper
