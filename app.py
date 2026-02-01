@@ -78,8 +78,8 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
-        self.setMinimumSize(280, 80)
-        self.resize(300, 100)
+        self.setMinimumSize(300, 80)
+        self.resize(320, 100)
 
         self.model = None
         self.model_name = DEFAULT_MODEL
