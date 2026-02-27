@@ -1,10 +1,14 @@
+import json
 import os
 import sys
 import time
+from pathlib import Path
 import numpy as np
 import sounddevice as sd
 import whisper
 from PySide6 import QtCore, QtGui, QtWidgets
+
+from codex_cli_wrapper import ask_codex
 
 
 APP_TITLE = "Whisper Clip"
@@ -73,6 +77,134 @@ class Transcriber(QtCore.QObject):
             self.error.emit(str(exc))
 
 
+class GlossaryProcessor(QtCore.QObject):
+    finished = QtCore.Signal(str, float)
+    error = QtCore.Signal(str)
+
+    def __init__(self, text: str, glossary: list[tuple[str, str]], cwd: str | None):
+        super().__init__()
+        self.text = text
+        self.glossary = glossary
+        self.cwd = cwd
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            start = time.time()
+            glossary_block = "\n".join(
+                f"- {term}: {desc}" if desc else f"- {term}" for term, desc in self.glossary
+            )
+            prompt = (
+                "You will receive a transcript and a glossary of preferred terms. "
+                "Replace likely misrecognized words with glossary terms when the context fits. "
+                "If no changes are needed, return the transcript unchanged. "
+                "Return only the corrected transcript without explanations.\n\n"
+                "Transcript:\n"
+                f"{self.text}\n\n"
+                "Glossary terms:\n"
+                f"{glossary_block}"
+            )
+            result = ask_codex(user_query=prompt, cwd=self.cwd)
+            cleaned = (result or "").strip()
+            elapsed = time.time() - start
+            if not cleaned:
+                cleaned = self.text
+            self.finished.emit(cleaned, elapsed)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class GlossaryDialog(QtWidgets.QDialog):
+    def __init__(self, terms: list[tuple[str, str]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Glossary")
+        self.setMinimumSize(420, 320)
+        self._terms = list(terms)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        helper = QtWidgets.QLabel("Add preferred terms and short descriptions.")
+        helper.setWordWrap(True)
+
+        entry_row = QtWidgets.QHBoxLayout()
+        self.new_term_input = QtWidgets.QLineEdit()
+        self.new_term_input.setPlaceholderText("Term")
+        self.new_desc_input = QtWidgets.QLineEdit()
+        self.new_desc_input.setPlaceholderText("Short description (optional)")
+        add_button = QtWidgets.QPushButton("Add")
+        add_button.clicked.connect(self._add_term)
+        entry_row.addWidget(self.new_term_input, 2)
+        entry_row.addWidget(self.new_desc_input, 3)
+        entry_row.addWidget(add_button)
+
+        self.table = QtWidgets.QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Term", "Description"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+
+        for term, desc in self._terms:
+            self._append_term_row(term, desc)
+
+        remove_button = QtWidgets.QPushButton("Remove selected")
+        remove_button.clicked.connect(self._remove_selected)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout.addWidget(helper)
+        layout.addLayout(entry_row)
+        layout.addWidget(self.table, 1)
+        layout.addWidget(remove_button)
+        layout.addWidget(buttons)
+
+    def _append_term_row(self, term: str, desc: str):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        term_item = QtWidgets.QTableWidgetItem(term)
+        term_item.setFlags(term_item.flags() | QtCore.Qt.ItemIsEditable)
+        desc_item = QtWidgets.QTableWidgetItem(desc)
+        desc_item.setFlags(desc_item.flags() | QtCore.Qt.ItemIsEditable)
+        self.table.setItem(row, 0, term_item)
+        self.table.setItem(row, 1, desc_item)
+
+    def _add_term(self):
+        term = self.new_term_input.text().strip()
+        desc = self.new_desc_input.text().strip()
+        if not term:
+            return
+        self._append_term_row(term, desc)
+        self.new_term_input.clear()
+        self.new_desc_input.clear()
+        self.new_term_input.setFocus()
+
+    def _remove_selected(self):
+        selection = self.table.selectionModel().selectedRows()
+        for index in sorted(selection, key=lambda idx: idx.row(), reverse=True):
+            self.table.removeRow(index.row())
+
+    def get_terms(self) -> list[tuple[str, str]]:
+        terms: list[tuple[str, str]] = []
+        for row in range(self.table.rowCount()):
+            term_item = self.table.item(row, 0)
+            if term_item is None:
+                continue
+            term = term_item.text().strip()
+            if term:
+                desc_item = self.table.item(row, 1)
+                desc = desc_item.text().strip() if desc_item else ""
+                terms.append((term, desc))
+        return terms
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -88,6 +220,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stream = None
         self.latest_text = ""
         self.transcript_visible = False
+        self.glossary_enabled = False
+        self.glossary_terms: list[tuple[str, str]] = []
+        self._pending_glossary_source = ""
+        self._last_transcription_time = 0.0
         self._collapsed_min_height = 80
         self._expanded_min_height = 300
         self._collapsed_size = None
@@ -95,6 +231,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_model_name = None
 
         self._build_ui()
+        self._load_glossary()
         self._load_model_async()
 
     def _build_ui(self):
@@ -140,6 +277,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._transcript_hide_icon = self.style().standardIcon(
             QtWidgets.QStyle.SP_FileDialogListView
         )
+        themed_gear = QtGui.QIcon.fromTheme("settings")
+        if themed_gear.isNull():
+            themed_gear = QtGui.QIcon.fromTheme("preferences-desktop-settings")
+        if themed_gear.isNull():
+            themed_gear = self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxInformation)
+        self._glossary_icon = themed_gear
 
         self.record_button = QtWidgets.QToolButton()
         self.record_button.setCheckable(True)
@@ -169,10 +312,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transcript_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
         self.transcript_toggle.setToolTip("Show/Hide transcript")
 
+        self.glossary_menu = QtWidgets.QMenu(self)
+        self.glossary_toggle_action = QtGui.QAction("Enable glossary", self)
+        self.glossary_toggle_action.setCheckable(True)
+        self.glossary_toggle_action.toggled.connect(self._toggle_glossary)
+        self.glossary_menu.addAction(self.glossary_toggle_action)
+        self.glossary_menu.addSeparator()
+        self.glossary_menu.addAction("Edit glossary\u2026", self._open_glossary_dialog)
+
+        self.glossary_button = QtWidgets.QToolButton()
+        self.glossary_button.setObjectName("GlossaryButton")
+        self.glossary_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.glossary_button.setMenu(self.glossary_menu)
+        self.glossary_button.setIcon(self._glossary_icon)
+        self.glossary_button.setIconSize(QtCore.QSize(18, 18))
+        self.glossary_button.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.glossary_button.setToolTip("Glossary settings")
+
         controls.addWidget(self.model_combo)
         controls.addWidget(self.record_button)
         controls.addWidget(self.copy_button)
         controls.addWidget(self.transcript_toggle)
+        controls.addWidget(self.glossary_button)
         controls.addStretch(1)
 
         status_row = QtWidgets.QHBoxLayout()
@@ -250,7 +411,7 @@ class MainWindow(QtWidgets.QMainWindow):
             #RecordButton:checked {
                 background-color: #22c55e;
             }
-            #CopyButton, #TranscriptToggle {
+            #CopyButton, #TranscriptToggle, #GlossaryButton {
                 background-color: #111827;
                 border: 1px solid #374151;
                 color: #e5e7eb;
@@ -277,6 +438,32 @@ class MainWindow(QtWidgets.QMainWindow):
             """
         )
 
+    def _glossary_store_path(self) -> Path:
+        return Path(__file__).resolve().parent / "glossary.json"
+
+    def _load_glossary(self):
+        path = self._glossary_store_path()
+        if not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            terms: list[tuple[str, str]] = []
+            for entry in payload if isinstance(payload, list) else []:
+                if not isinstance(entry, dict):
+                    continue
+                term = str(entry.get("term", "")).strip()
+                desc = str(entry.get("description", "")).strip()
+                if term:
+                    terms.append((term, desc))
+            self.glossary_terms = terms
+        except Exception as exc:
+            self._set_status(f"Glossary load failed: {exc}")
+
+    def _save_glossary(self):
+        path = self._glossary_store_path()
+        payload = [{"term": term, "description": desc} for term, desc in self.glossary_terms]
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def _set_status(self, message: str):
         self.status_label.setText(message)
 
@@ -285,6 +472,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clipboard_label.setProperty("state", state)
         self.clipboard_label.style().unpolish(self.clipboard_label)
         self.clipboard_label.style().polish(self.clipboard_label)
+
+    def _toggle_glossary(self, enabled: bool):
+        self.glossary_enabled = enabled
+        if self.glossary_enabled and not self.glossary_terms:
+            self._set_status("Glossary enabled (no terms yet).")
+        elif self.glossary_enabled:
+            self._set_status("Glossary enabled.")
+        else:
+            self._set_status("Glossary disabled.")
+
+    def _open_glossary_dialog(self):
+        dialog = GlossaryDialog(self.glossary_terms, self)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            self.glossary_terms = dialog.get_terms()
+            try:
+                self._save_glossary()
+            except Exception as exc:
+                self._set_status(f"Glossary save failed: {exc}")
+            if self.glossary_enabled and not self.glossary_terms:
+                self._set_status("Glossary enabled (no terms yet).")
+            elif self.glossary_enabled:
+                self._set_status(f"Glossary updated ({len(self.glossary_terms)} terms).")
 
     def _on_model_change(self, model_name: str):
         if self.recording:
@@ -423,12 +632,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str, float)
     def _on_transcription_finished(self, text: str, elapsed: float):
+        self._last_transcription_time = elapsed
         self.latest_text = text
         self.text_area.setPlainText(text)
         self.copy_button.setEnabled(bool(text))
         QtWidgets.QApplication.clipboard().setText(text)
+        if text and self.glossary_enabled and self.glossary_terms:
+            self._pending_glossary_source = text
+            self._start_glossary_processing(text)
+            return
         if text:
-            self._set_status(f"Done in {elapsed:.1f}s. Copied to clipboard.")
+            self._set_status(f"Done in {elapsed:.1f}s. Copied.")
             self._set_clipboard_state("ready", "Clipboard: ready")
         else:
             self._set_status("Done, but no speech detected.")
@@ -442,6 +656,49 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_worker_finished(self):
         self.record_button.setEnabled(True)
         self.model_combo.setEnabled(True)
+
+    def _start_glossary_processing(self, text: str):
+        self._set_status("Applying glossary\u2026")
+        self._set_clipboard_state("working", "Clipboard: applying glossary")
+
+        self.glossary_thread = QtCore.QThread(self)
+        project_root = str(Path(__file__).resolve().parent)
+        self.glossary_worker = GlossaryProcessor(text, self.glossary_terms, project_root)
+        self.glossary_worker.moveToThread(self.glossary_thread)
+
+        self.glossary_thread.started.connect(self.glossary_worker.run)
+        self.glossary_worker.finished.connect(self._on_glossary_finished)
+        self.glossary_worker.error.connect(self._on_glossary_error)
+        self.glossary_worker.finished.connect(self.glossary_thread.quit)
+        self.glossary_worker.error.connect(self.glossary_thread.quit)
+
+        self.glossary_thread.start()
+
+    @QtCore.Slot(str, float)
+    def _on_glossary_finished(self, text: str, elapsed: float):
+        self._pending_glossary_source = ""
+        self.latest_text = text
+        self.text_area.setPlainText(text)
+        self.copy_button.setEnabled(bool(text))
+        QtWidgets.QApplication.clipboard().setText(text)
+        if text:
+            total = self._last_transcription_time + elapsed
+            self._set_status(f"Done in {total:.1f}s. Copied.")
+            self._set_clipboard_state("ready", "Clipboard: ready")
+        else:
+            self._set_status("Glossary applied, but no text returned.")
+            self._set_clipboard_state("empty", "Clipboard: empty")
+
+    @QtCore.Slot(str)
+    def _on_glossary_error(self, message: str):
+        fallback = self._pending_glossary_source or self.latest_text
+        self._pending_glossary_source = ""
+        if fallback:
+            self.latest_text = fallback
+            self.text_area.setPlainText(fallback)
+            QtWidgets.QApplication.clipboard().setText(fallback)
+        self._set_status(f"Glossary failed: {message}")
+        self._set_clipboard_state("empty", "Clipboard: error")
 
     def _copy_latest(self):
         if not self.latest_text:

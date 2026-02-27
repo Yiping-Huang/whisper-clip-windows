@@ -1,2 +1,4 @@
 .venv
 model
+glossary.json
+__pycache__
